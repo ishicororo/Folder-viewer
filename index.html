@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>完全HTMLビューア</title>
+  <style>
+    body { font-family: sans-serif; margin: 0; }
+    #drop-area {
+      border: 2px dashed #ccc;
+      padding: 30px;
+      text-align: center;
+      margin: 20px;
+      font-size: 1.2em;
+      color: #666;
+    }
+    #file-list {
+      white-space: pre-wrap;
+      padding: 10px 20px;
+      background: #f9f9f9;
+      border-top: 1px solid #ccc;
+      cursor: pointer;
+    }
+    #start-btn {
+      display: block;
+      margin: 20px auto;
+      padding: 10px 20px;
+      font-size: 1em;
+    }
+    #viewer-container {
+      display: none;
+      position: fixed;
+      top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      background: white;
+      z-index: 999;
+    }
+    #viewer {
+      width: 100%; height: 100%;
+      border: none;
+    }
+    #close-btn {
+      position: absolute;
+      top: 10px; left: 10px;
+      font-size: 24px;
+      background: transparent;
+      border: none;
+      cursor: pointer;
+      z-index: 1000;
+    }
+    #nav-btns {
+      position: absolute;
+      top: 10px; right: 10px;
+      z-index: 1000;
+    }
+    #nav-btns button {
+      font-size: 20px;
+      margin: 0 5px;
+    }
+    .file-link {
+      color: blue;
+      text-decoration: underline;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <div id="drop-area">ここにフォルダをドラッグ＆ドロップ</div>
+  <div id="file-list"></div>
+  <button id="start-btn" disabled>スタート</button>
+
+  <div id="viewer-container">
+    <div id="nav-btns">
+      <button id="back-btn">&lt;</button>
+      <button id="forward-btn">&gt;</button>
+    </div>
+    <button id="close-btn">✖</button>
+    <iframe id="viewer" sandbox="allow-scripts allow-same-origin"></iframe>
+  </div>
+
+  <script>
+    const dropArea = document.getElementById('drop-area');
+    const fileListDiv = document.getElementById('file-list');
+    const startBtn = document.getElementById('start-btn');
+    const viewer = document.getElementById('viewer');
+    const viewerContainer = document.getElementById('viewer-container');
+    const closeBtn = document.getElementById('close-btn');
+    const backBtn = document.getElementById('back-btn');
+    const forwardBtn = document.getElementById('forward-btn');
+
+    let fileMap = new Map();
+    let allPaths = [];
+    let historyStack = [];
+    let historyIndex = -1;
+
+    dropArea.addEventListener('dragover', e => {
+      e.preventDefault();
+      dropArea.style.background = "#eef";
+    });
+
+    dropArea.addEventListener('dragleave', () => {
+      dropArea.style.background = "";
+    });
+
+    dropArea.addEventListener('drop', async e => {
+      e.preventDefault();
+      dropArea.style.background = "";
+      fileMap.clear();
+      allPaths = [];
+
+      const items = e.dataTransfer.items;
+      for (const item of items) {
+        const entry = item.webkitGetAsEntry();
+        if (entry) await traverse(entry, '');
+      }
+
+      allPaths.sort();
+      renderFileList();
+      startBtn.disabled = false;
+    });
+
+    startBtn.onclick = async () => {
+      const indexEntry = [...fileMap.entries()].find(([path]) =>
+        path.endsWith('index.html') || path.endsWith('index.htm')
+      );
+
+      if (indexEntry) {
+        const [indexPath, file] = indexEntry;
+        const html = await readAsText(file);
+        const modified = await rewriteHTML(html, indexPath);
+        openBlob(modified, 'text/html');
+      } else {
+        const html = await generateIndexOf(allPaths);
+        openBlob(html, 'text/html');
+      }
+
+      viewerContainer.style.display = 'block';
+    };
+
+    closeBtn.onclick = () => {
+      viewerContainer.style.display = 'none';
+      viewer.src = '';
+    };
+
+    backBtn.onclick = () => {
+      if (historyIndex > 0) {
+        historyIndex--;
+        viewer.src = historyStack[historyIndex];
+      }
+    };
+
+    forwardBtn.onclick = () => {
+      if (historyIndex < historyStack.length - 1) {
+        historyIndex++;
+        viewer.src = historyStack[historyIndex];
+      }
+    };
+
+    async function traverse(entry, basePath) {
+      return new Promise(resolve => {
+        if (entry.isFile) {
+          entry.file(file => {
+            const path = basePath + entry.name;
+            fileMap.set(path, file);
+            allPaths.push(path);
+            resolve();
+          });
+        } else if (entry.isDirectory) {
+          const reader = entry.createReader();
+          reader.readEntries(async entries => {
+            for (const e of entries) {
+              await traverse(e, basePath + entry.name + '/');
+            }
+            resolve();
+          });
+        }
+      });
+    }
+
+    function readAsText(file) {
+      return new Promise(resolve => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.readAsText(file);
+      });
+    }
+
+    async function rewriteHTML(html, basePath) {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(html, 'text/html');
+
+      const fixAttr = async (el, attr) => {
+        const src = el.getAttribute(attr);
+        if (!src || src.startsWith('http') || src.startsWith('data:')) return;
+        const url = resolvePath(basePath, src);
+        const f = fileMap.get(url);
+        if (f) {
+          const blob = new Blob([await f.arrayBuffer()], { type: getMime(f.name) });
+          const blobURL = URL.createObjectURL(blob);
+          el.setAttribute(attr, blobURL);
+        }
+      };
+
+      for (const el of doc.querySelectorAll('script[src]')) await fixAttr(el, 'src');
+      for (const el of doc.querySelectorAll('link[href]')) await fixAttr(el, 'href');
+      for (const el of doc.querySelectorAll('img[src]')) await fixAttr(el, 'src');
+
+      return '<!DOCTYPE html>\n' + doc.documentElement.outerHTML;
+    }
+
+    function resolvePath(base, relative) {
+      const baseParts = base.split('/');
+      baseParts.pop();
+      const relParts = relative.split('/');
+      for (const part of relParts) {
+        if (part === '.') continue;
+        else if (part === '..') baseParts.pop();
+        else baseParts.push(part);
+      }
+      return baseParts.join('/');
+    }
+
+    function getMime(name) {
+      return name.endsWith('.js') ? 'application/javascript' :
+             name.endsWith('.css') ? 'text/css' :
+             name.endsWith('.html') || name.endsWith('.htm') ? 'text/html' :
+             name.endsWith('.json') ? 'application/json' :
+             name.endsWith('.png') ? 'image/png' :
+             name.endsWith('.jpg') || name.endsWith('.jpeg') ? 'image/jpeg' :
+             name.endsWith('.svg') ? 'image/svg+xml' :
+             'application/octet-stream';
+    }
+
+    function openBlob(content, mime) {
+      const blob = new Blob([content], { type: mime });
+      const url = URL.createObjectURL(blob);
+      historyStack = historyStack.slice(0, historyIndex + 1);
+      historyStack.push(url);
+      historyIndex++;
+      viewer.src = url;
+    }
+
+    async function openFile(path) {
+      const file = fileMap.get(path);
+      if (!file) return;
+      const mime = getMime(file.name);
+      if (mime.startsWith('text/')) {
+        if (mime === 'text/html') {
+          const html = await readAsText(file);
+          const modified = await rewriteHTML(html, path);
+          openBlob(modified, mime);
+        } else {
+          const text = await readAsText(file);
+          openBlob(text, mime);
+        }
+      } else {
+        openBlob(await file.arrayBuffer(), mime);
+      }
+      viewerContainer.style.display = 'block';
+    }
+
+    function renderFileList() {
+      const tree = {};
+      for (const path of allPaths) {
+        const parts = path.split('/');
+        let cur = tree;
+        for (const part of parts) {
+          cur[part] = cur[part] || {};
+          cur = cur[part];
+        }
+      }
+
+      function format(node, prefix = '', path = '') {
+        return Object.entries(node).map(([name, child]) => {
+          const fullPath = path ? path + '/' + name : name;
+          if (Object.keys(child).length) {
+            return prefix + '📁 ' + name + '\n' + format(child, prefix + '  ', fullPath);
+          } else {
+            return prefix + `<span class="file-link" data-path="${fullPath}">📄 ${name}</span>\n`;
+          }
+        }).join('');
+      }
+
+      fileListDiv.innerHTML = format(tree);
+      fileListDiv.querySelectorAll('.file-link').forEach(el => {
+        el.addEventListener('click', () => {
+          const path = el.getAttribute('data-path');
+          openFile(path);
+        });
+      });
+    }
+
+    async function generateIndexOf(paths) {
+      const tree = {};
+      for (const path of paths) {
+        const parts = path.split('/');
+        let cur = tree;
+        for (const part of parts) {
+          cur[part] = cur[part] || {};
+          cur = cur[part];
+        }
+      }
+
+      function format(node, prefix = '', path = '') {
+        return Object.entries(node).map(([name, child]) => {
+          const fullPath = path ? path + '/' + name : name;
+          if (Object.keys(child).length) {
+            return prefix + '📁 ' + name + '<br>' + format(child, prefix + '&nbsp;&nbsp;', fullPath);
+          } else {
+            const file = fileMap.get(fullPath);
+            const blob = URL.createObjectURL(file);
+            return prefix + `<a href="${blob}" target="_blank">${name}</a><br>`;
+          }
+        }).join('');
+      }
+
+      return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Index of</title></head><body>
+              <h1>Index of</h1><pre>${format(tree)}</pre></body></html>`;
+    }
+  </script>
+</body>
+</html>
